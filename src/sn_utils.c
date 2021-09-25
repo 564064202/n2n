@@ -38,6 +38,7 @@ static int sendto_mgmt (n2n_sn_t *sss,
 static uint16_t reg_lifetime (n2n_sn_t *sss);
 
 static int update_edge (n2n_sn_t *sss,
+                        const n2n_common_t* cmn,
                         const n2n_REGISTER_SUPER_t* reg,
                         struct sn_community *comm,
                         const n2n_sock_t *sender_sock,
@@ -152,8 +153,8 @@ void calculate_dynamic_keys (n2n_sn_t *sss) {
         if(comm->allowed_users) {
             calculate_dynamic_key(comm->dynamic_key,           /* destination */
                                   sss->dynamic_key_time,       /* time - same for all */
-                                  comm->community,             /* community name */
-                                  sss->federation->community); /* federation name */
+                                  (uint8_t *)comm->community,  /* community name */
+                                  (uint8_t *)sss->federation->community); /* federation name */
             packet_header_change_dynamic_key(comm->dynamic_key,
                                              &(comm->header_encryption_ctx_dynamic),
                                              &(comm->header_iv_ctx_dynamic));
@@ -216,7 +217,7 @@ int load_allowed_sn_community (n2n_sn_t *sss) {
     sn_user_t *user, *tmp_user;
     n2n_desc_t username;
     n2n_private_public_key_t public_key;
-    uint8_t ascii_public_key[(N2N_PRIVATE_PUBLIC_KEY_SIZE * 8 + 5) / 6 + 1];
+    char ascii_public_key[(N2N_PRIVATE_PUBLIC_KEY_SIZE * 8 + 5) / 6 + 1];
 
     dec_ip_str_t ip_str = {'\0'};
     uint8_t bitlen;
@@ -306,7 +307,7 @@ int load_allowed_sn_community (n2n_sn_t *sss) {
     re_register_and_purge_supernodes(sss, sss->federation, &any_time, any_time, 1 /* forced */);
 
     // format definition for possible user-key entries
-    sprintf(format, "%c %%%ds %%%ds", N2N_USER_KEY_LINE_STARTER, N2N_DESC_SIZE - 1, sizeof(ascii_public_key)-1);
+    sprintf(format, "%c %%%ds %%%lds", N2N_USER_KEY_LINE_STARTER, N2N_DESC_SIZE - 1, sizeof(ascii_public_key)-1);
 
     while((line = fgets(buffer, sizeof(buffer), fd)) != NULL) {
         int len = strlen(line);
@@ -729,10 +730,6 @@ int comm_init (struct sn_community *comm, char *cmn) {
 
 /** Initialise the supernode structure */
 int sn_init_defaults (n2n_sn_t *sss) {
-
-    int i;
-    size_t idx;
-
 #ifdef WIN32
     initWin32();
 #endif
@@ -741,6 +738,7 @@ int sn_init_defaults (n2n_sn_t *sss) {
 
     memset(sss, 0, sizeof(n2n_sn_t));
 
+    strncpy(sss->version, GIT_RELEASE, sizeof(n2n_version_t) - 1);
     sss->daemon = 1; /* By defult run as a daemon. */
     sss->lport = N2N_SN_LPORT_DEFAULT;
     sss->mport = N2N_SN_MGMT_PORT;
@@ -789,7 +787,7 @@ int sn_init_defaults (n2n_sn_t *sss) {
 
 
 /** Initialise the supernode */
-int sn_init (n2n_sn_t *sss) {
+void sn_init (n2n_sn_t *sss) {
 
     if(resolve_create_thread(&(sss->resolve_parameter), sss->federation->edges) == 0) {
          traceEvent(TRACE_NORMAL, "successfully created resolver thread");
@@ -982,6 +980,7 @@ static int handle_remote_auth (n2n_sn_t *sss, const n2n_auth_t *remote_auth,
     switch(remote_auth->scheme) {
         // we do not handle n2n_auth_none because the edge always edge always uses either id or user/password
         // auth_none is sn-internal only (skipping MAC/IP address spoofing protection)
+        case n2n_auth_none:
         case n2n_auth_simple_id:
             // zero_token answer
             memset(answer_auth, 0, sizeof(n2n_auth_t));
@@ -1020,6 +1019,7 @@ static int handle_remote_auth (n2n_sn_t *sss, const n2n_auth_t *remote_auth,
 /** Update the edge table with the details of the edge which contacted the
  *    supernode. */
 static int update_edge (n2n_sn_t *sss,
+                        const n2n_common_t* cmn,
                         const n2n_REGISTER_SUPER_t* reg,
                         struct sn_community *comm,
                         const n2n_sock_t *sender_sock,
@@ -1063,8 +1063,13 @@ static int update_edge (n2n_sn_t *sss,
                 memcpy((char*)scan->dev_desc, reg->dev_desc, N2N_DESC_SIZE);
                 memcpy(&(scan->sock), sender_sock, sizeof(n2n_sock_t));
                 scan->socket_fd = socket_fd;
-                memcpy(&(scan->last_cookie), reg->cookie, sizeof(N2N_COOKIE_SIZE));
+                scan->last_cookie = reg->cookie;
                 scan->last_valid_time_stamp = initial_time_stamp();
+                // eventually, store edge's preferred local socket from REGISTER_SUPER
+                if(cmn->flags & N2N_FLAGS_SOCKET)
+                    memcpy(&scan->preferred_sock, &reg->sock, sizeof(n2n_sock_t));
+                else
+                    scan->preferred_sock.family = AF_INVALID;
 
                 // store the submitted auth token
                 memcpy(&(scan->auth), &(reg->auth), sizeof(n2n_auth_t));
@@ -1090,14 +1095,19 @@ static int update_edge (n2n_sn_t *sss,
             if(!sock_equal(sender_sock, &(scan->sock))) {
                 memcpy(&(scan->sock), sender_sock, sizeof(n2n_sock_t));
                 scan->socket_fd = socket_fd;
-                memcpy(&(scan->last_cookie), reg->cookie, sizeof(N2N_COOKIE_SIZE));
+                scan->last_cookie = reg->cookie;
+                // eventually, update edge's preferred local socket from REGISTER_SUPER
+                if(cmn->flags & N2N_FLAGS_SOCKET)
+                    memcpy(&scan->preferred_sock, &reg->sock, sizeof(n2n_sock_t));
+                else
+                    scan->preferred_sock.family = AF_INVALID;
 
                 traceEvent(TRACE_INFO, "updated edge  %s ==> %s",
                            macaddr_str(mac_buf, reg->edgeMac),
                            sock_to_cstr(sockbuf, sender_sock));
                 ret = update_edge_sock_change;
             } else {
-                memcpy(&(scan->last_cookie), reg->cookie, sizeof(N2N_COOKIE_SIZE));
+                scan->last_cookie = reg->cookie;
 
                 traceEvent(TRACE_DEBUG, "edge unchanged %s ==> %s",
                            macaddr_str(mac_buf, reg->edgeMac),
@@ -1343,7 +1353,6 @@ static int re_register_and_purge_supernodes (n2n_sn_t *sss, struct sn_community 
             size_t idx;
             /* ssize_t sent; */
             n2n_common_t cmn;
-            n2n_cookie_t cookie;
             n2n_REGISTER_SUPER_t reg;
             n2n_sock_str_t sockbuf;
 
@@ -1355,9 +1364,8 @@ static int re_register_and_purge_supernodes (n2n_sn_t *sss, struct sn_community 
             cmn.flags = N2N_FLAGS_FROM_SUPERNODE;
             memcpy(cmn.community, comm->community, N2N_COMMUNITY_SIZE);
 
-            memrnd(cookie, N2N_COOKIE_SIZE);
-            memcpy(reg.cookie, cookie, N2N_COOKIE_SIZE);
-            memcpy(peer->last_cookie, cookie, N2N_COOKIE_SIZE);
+            reg.cookie = n2n_rand();
+            peer->last_cookie = reg.cookie;
 
             reg.dev_addr.net_addr = ntohl(peer->dev_addr.net_addr);
             reg.dev_addr.net_bitlen = mask2bitlen(ntohl(peer->dev_addr.net_bitlen));
@@ -2075,7 +2083,7 @@ static int process_udp (n2n_sn_t * sss,
             cmn2.flags = N2N_FLAGS_SOCKET | N2N_FLAGS_FROM_SUPERNODE;
             memcpy(cmn2.community, cmn.community, sizeof(n2n_community_t));
 
-            memcpy(&(ack.cookie), &(reg.cookie), sizeof(n2n_cookie_t));
+            ack.cookie = reg.cookie;
             memcpy(ack.srcMac, sss->mac_addr, sizeof(n2n_mac_t));
 
             if(comm->is_federation != IS_FEDERATION) { /* alternatively, do not send zero tap ip address in federation REGISTER_SUPER */
@@ -2115,7 +2123,7 @@ static int process_udp (n2n_sn_t * sss,
                     skip--;
                     continue;
                 }
-                if(peer->sock.family == AF_INVALID)
+                if(peer->sock.family == (uint8_t)AF_INVALID)
                     continue; /* do not add unresolved supernodes to payload */
                 if(memcmp(&(peer->sock), &(ack.sock), sizeof(n2n_sock_t)) == 0) continue; /* a supernode doesn't add itself to the payload */
                 if((now - peer->last_seen) >= LAST_SEEN_SN_NEW) continue;  /* skip long-time-not-seen supernodes.
@@ -2136,18 +2144,18 @@ static int process_udp (n2n_sn_t * sss,
             // check authentication
             ret_value = update_edge_no_change;
             if(comm->is_federation != IS_FEDERATION) { /* REVISIT: auth among supernodes is not implemented yet */
-                if(cmn.flags & N2N_FLAGS_SOCKET) {
-                    ret_value = update_edge(sss, &reg, comm, &(ack.sock), socket_fd, &(ack.auth), SN_ADD_SKIP, now);
+                if(cmn.flags & N2N_FLAGS_FROM_SUPERNODE) {
+                    ret_value = update_edge(sss, &cmn, &reg, comm, &(ack.sock), socket_fd, &(ack.auth), SN_ADD_SKIP, now);
                 } else {
                     // do not add in case of null mac (edge asking for ip address)
-                    ret_value = update_edge(sss, &reg, comm, &(ack.sock), socket_fd, &(ack.auth), is_null_mac(reg.edgeMac) ? SN_ADD_SKIP : SN_ADD, now);
+                    ret_value = update_edge(sss, &cmn, &reg, comm, &(ack.sock), socket_fd, &(ack.auth), is_null_mac(reg.edgeMac) ? SN_ADD_SKIP : SN_ADD, now);
                 }
             }
 
             if(ret_value == update_edge_auth_fail) {
                 // send REGISTER_SUPER_NAK
                 cmn2.pc = n2n_register_super_nak;
-                memcpy(&(nak.cookie), &(reg.cookie), sizeof(n2n_cookie_t));
+                nak.cookie = reg.cookie;
                 memcpy(nak.srcMac, reg.edgeMac, sizeof(n2n_mac_t));
 
                 encode_REGISTER_SUPER_NAK(ackbuf, &encx, &cmn2, &nak);
@@ -2166,8 +2174,9 @@ static int process_udp (n2n_sn_t * sss,
                 traceEvent(TRACE_DEBUG, "Tx REGISTER_SUPER_NAK for %s",
                            macaddr_str(mac_buf, reg.edgeMac));
             } else {
-                // if this is not already forwarded from a supernode, ...
-                if(!(cmn.flags & N2N_FLAGS_SOCKET)) {
+                // if this is not already from a supernode ...
+                // and not from federation, ...
+                if((!(cmn.flags & N2N_FLAGS_FROM_SUPERNODE)) || (!(cmn.flags & N2N_FLAGS_SOCKET))) {
                     // ... forward to all other supernodes (note try_broadcast()'s behavior with
                     //     NULL comm and from_supernode parameter)
                     // exception: do not forward auto ip draw
@@ -2360,7 +2369,7 @@ static int process_udp (n2n_sn_t * sss,
                 break;
             }
 
-            if(0 == memcmp(ack.cookie, scan->last_cookie, N2N_COOKIE_SIZE)) {
+            if(ack.cookie == scan->last_cookie) {
 
                 payload = (n2n_REGISTER_SUPER_ACK_payload_t *)dec_tmpbuf;
                 for(i = 0; i < ack.num_sn; i++) {
@@ -2529,6 +2538,9 @@ static int process_udp (n2n_sn_t * sss,
                 memcpy(pi.sock.addr.v4, &(sender_sock->sin_addr.s_addr), IPV4_SIZE);
                 pi.data = sn_selection_criterion_gather_data(sss);
 
+                snprintf(pi.version, sizeof(pi.version), "%s", sss->version);
+                pi.uptime = now - sss->start_time;
+
                 encode_PEER_INFO(encbuf, &encx, &cmn2, &pi);
 
                 if(comm) {
@@ -2568,6 +2580,10 @@ static int process_udp (n2n_sn_t * sss,
                     memcpy(pi.srcMac, query.srcMac, sizeof(n2n_mac_t));
                     memcpy(pi.mac, query.targetMac, sizeof(n2n_mac_t));
                     pi.sock = scan->sock;
+                    if(scan->preferred_sock.family != (uint8_t)AF_INVALID) {
+                        cmn2.flags |= N2N_FLAGS_SOCKET;
+                        pi.preferred_sock = scan->preferred_sock;
+                    }
 
                     encode_PEER_INFO(encbuf, &encx, &cmn2, &pi);
 
@@ -2684,7 +2700,7 @@ int run_sn_loop (n2n_sn_t *sss, int *keep_running) {
         ssize_t bread;
         int max_sock;
         fd_set socket_mask;
-        n2n_tcp_connection_t *conn, *next, *tmp_conn;
+        n2n_tcp_connection_t *conn, *tmp_conn;
 
         SOCKET tmp_sock;
         n2n_sock_str_t sockbuf;

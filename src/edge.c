@@ -160,7 +160,9 @@ static void help (int level) {
                " -c <community name>"
                " -l <supernode host:port>"
             "\n                      "
-               "[-p <local port>] "
+               "[-p [<local bind ip address>:]<local port>] "
+            "\n                      "
+
 #ifdef __linux__
                "[-T <type of service>] "
 #endif
@@ -168,15 +170,15 @@ static void help (int level) {
                "[-D] "
 #endif
             "\n options for under-   "
-               "[-i <registration interval>]"
-               "[-L <registration ttl>]"
+               "[-i <registration interval>] "
+               "[-L <registration ttl>] "
             "\n lying connection     "
                "[-k <key>] "
                "[-A<cipher>] "
                "[-H] "
-               "[-z<compression>]"
+               "[-z<compression>] "
             "\n                      "
-               "[-b <bind IP address>][-S<level of solitude>]"
+               "[-e <preferred local IP address>] [-S<level of solitude>]"
           "\n\n tap device and       "
                "[-a [static:|dhcp:]<tap IP address>[/<cidr suffix>]] "
             "\n overlay network      "
@@ -206,8 +208,8 @@ static void help (int level) {
                "[-n <cidr:gateway>] "
 #ifndef WIN32
             "\n                      "
-               "[-u <numerical user id>]"
-               "[-g <numerical group id>]"
+               "[-u <numerical user id>] "
+               "[-g <numerical group id>] "
 #endif
           "\n\n environment          "
                "N2N_KEY         instead of [-k <key>]"
@@ -244,7 +246,8 @@ static void help (int level) {
         printf (" ---------------------------------------------\n\n");
         printf(" -c <community>    | n2n community name the edge belongs to\n");
         printf(" -l <host:port>    | supernode ip address or name, and port\n");
-        printf(" -p <local port>   | fixed local UDP port\n");
+        printf(" -p [<ip>:]<port>  | fixed local UDP port and optionally bind to the\n"
+               "                   | sepcified local IP address only (any by default)\n");
 #ifdef __linux__
         printf(" -T <tos>          | TOS for packets, e.g. 0x48 for SSH like priority\n");
 #endif
@@ -252,8 +255,9 @@ static void help (int level) {
         printf(" -D                | enable PMTU discovery, it can reduce fragmentation but\n"
                "                   | causes connections to stall if not properly supported\n");
 #endif
-        printf(" -b <bind ip>      | bind the edge to the provided local IP address only,\n"
-               "                   | defaults to 'any' ip address if not provided\n");
+        printf(" -e <local ip>     | advertises the provided local IP address as preferred,\n"
+               "                   | useful if multicast peer detection is not available,\n"
+               "                   | '-e auto' tries IP address auto-detection\n");
         printf(" -S1 ... -S2       | do not connect p2p, always use the supernode,\n"
                "                   | -S1 = via UDP"
 
@@ -582,25 +586,60 @@ static int setOption (int optkey, char *optargument, n2n_tuntap_priv_config_t *e
         }
 
         case 'p': {
-            conf->local_port = atoi(optargument);
+            char* colon = strpbrk(optargument, ":");
+            if(colon) { /*ip address:port */
+                *colon = 0;
+                conf->bind_address = ntohl(inet_addr(optargument));
+                conf->local_port = atoi(++colon);
 
-            if(conf->local_port == 0) {
-                traceEvent(TRACE_WARNING, "bad local port format, using OS assigned port");
-                break;
+                if(conf->bind_address == INADDR_NONE) {
+                    traceEvent(TRACE_WARNING, "bad address to bind to, binding to any IP address");
+                    conf->bind_address = INADDR_ANY;
+                }
+                if(conf->local_port == 0) {
+                    traceEvent(TRACE_WARNING, "bad local port format, using OS assigned port");
+                }
+            } else { /* ip address or port only */
+                char* dot = strpbrk(optargument, ".");
+                if(dot) { /* ip address only */
+                    conf->bind_address = ntohl(inet_addr(optargument));
+                    if(conf->bind_address == INADDR_NONE) {
+                        traceEvent(TRACE_WARNING, "bad address to bind to, binding to any IP address");
+                        conf->bind_address = INADDR_ANY;
+                    }
+                } else { /* port only */
+                    conf->local_port = atoi(optargument);
+                     if(conf->local_port == 0) {
+                        traceEvent(TRACE_WARNING, "bad local port format, using OS assigned port");
+                    }
+                }
             }
-
             break;
         }
 
-        case 'b': {
-            if(optargument) {
-                conf->bind_address = ntohl(inet_addr(optargument));
+        case 'e': {
+            in_addr_t address_tmp;
 
-                if(conf->bind_address == INADDR_NONE) {
-                    traceEvent(TRACE_WARNING, "Bad address to bind to, binding to any IP address.");
-                    conf->bind_address = INADDR_ANY;
-                    break;
+            if(optargument) {
+
+                if(!strcmp(optargument, "auto")) {
+                    address_tmp = INADDR_ANY;
+                    conf->preferred_sock_auto = 1;
+                } else {
+                    address_tmp = inet_addr(optargument);
                 }
+
+                memcpy(&(conf->preferred_sock.addr.v4), &(address_tmp), IPV4_SIZE);
+
+                if(address_tmp == INADDR_NONE) {
+                    traceEvent(TRACE_WARNING, "bad address for preferred local socket, skipping");
+                    conf->preferred_sock.family = AF_INVALID;
+                    break;
+                } else {
+                    conf->preferred_sock.family = AF_INET;
+                    // port is set after parsing all cli parameters during supernode_connect()
+                }
+
             }
 
             break;
@@ -728,7 +767,6 @@ static const struct option long_options[] =
         { "tap-device",        required_argument, NULL, 'd' },
         { "euid",              required_argument, NULL, 'u' },
         { "egid",              required_argument, NULL, 'g' },
-        { "bind",              required_argument, NULL, 'b' },
         { "help"     ,         no_argument,       NULL, '@' }, /* special character '@' to identify long help case */
         { "verbose",           no_argument,       NULL, 'v' },
         { NULL,                0,                 NULL,  0  }
@@ -742,7 +780,7 @@ static int loadFromCLI (int argc, char *argv[], n2n_edge_conf_t *conf, n2n_tunta
     u_char c;
 
     while ((c = getopt_long(argc, argv,
-                            "k:a:b:c:Eu:g:m:M:s:d:l:p:fvhrt:i:I:J:P:S::DL:z::A::Hn:R:"
+                            "k:a:c:Eu:g:m:M:s:d:l:p:fvhrt:i:I:J:P:S::DL:z::A::Hn:R:e:"
 #ifdef __linux__
                             "T:"
 #endif
@@ -993,7 +1031,7 @@ int main (int argc, char* argv[]) {
         // calculate public key and shared secret
         if(conf.federation_public_key) {
             traceEvent(TRACE_NORMAL, "using username and password for edge authentication");
-            bind_private_key_to_username(*(conf.shared_secret), conf.dev_desc);
+            bind_private_key_to_username(*(conf.shared_secret), (char *)conf.dev_desc);
             conf.public_key = calloc(1, sizeof(n2n_private_public_key_t));
             if(conf.public_key)
                 generate_public_key(*conf.public_key, *(conf.shared_secret));
@@ -1071,7 +1109,6 @@ int main (int argc, char* argv[]) {
     eee->last_sup = 0; /* if it wasn't zero yet */
     eee->curr_sn = eee->conf.supernodes;
     supernode_connect(eee);
-
     while(runlevel < 5) {
 
         now = time(NULL);

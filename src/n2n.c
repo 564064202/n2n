@@ -34,7 +34,7 @@ SOCKET open_socket (int local_port, in_addr_t address, int type /* 0 = UDP, TCP 
     struct sockaddr_in local_address;
     int sockopt;
 
-    if((sock_fd = socket(PF_INET, ((type == 0) ? SOCK_DGRAM : SOCK_STREAM) , 0)) < 0) {
+    if((int)(sock_fd = socket(PF_INET, ((type == 0) ? SOCK_DGRAM : SOCK_STREAM) , 0)) < 0) {
         traceEvent(TRACE_ERROR, "Unable to create socket [%s][%d]\n",
                    strerror(errno), sock_fd);
         return(-1);
@@ -302,8 +302,8 @@ int supernode2sock (n2n_sock_t *sn, const n2n_sn_name_t addrIn) {
             rv = -3;
         }
     } else {
-        traceEvent(TRACE_WARNING, "supernode2sock sees malformed supernode parameter (-l <host:port>) %s %s:%s",
-                   addr, supernode_host, supernode_port);
+        traceEvent(TRACE_WARNING, "supernode2sock sees malformed supernode parameter (-l <host:port>) %s",
+                   addrIn);
         rv = -4;
     }
 
